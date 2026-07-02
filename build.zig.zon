@@ -1,7 +1,7 @@
 .{
     .name = .assets_manager,
     .version = "0.1.1",
-    .fingerprint = 0x44c12503dcf873d5,
+    .fingerprint = 0x68c2aff382ad1317,
     .minimum_zig_version = "0.16.0",
 
     .paths = .{

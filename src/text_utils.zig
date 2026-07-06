@@ -1,37 +1,48 @@
 const std = @import("std");
 
-pub fn renderTemplate(
+pub fn filenameToIdentifier(
     allocator: std.mem.Allocator,
-    template: []const u8,
-    values: std.StringHashMap([]const u8),
+    filename: []const u8,
 ) ![]u8 {
-    var result: std.ArrayList(u8) = .empty;
-    errdefer result.deinit(allocator);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
 
-    var i: usize = 0;
-    while (i < template.len) {
-        if (template[i] == '{') {
-            if (std.mem.indexOfScalarPos(u8, template, i, '}')) |close| {
-                const key = template[i + 1 .. close];
-                if (values.get(key)) |val| {
-                    try result.appendSlice(allocator, val);
-                    i = close + 1;
-                    continue;
-                }
-            }
-        }
-        try result.append(allocator, template[i]);
-        i += 1;
+    if (filename.len == 0) {
+        return allocator.dupe(u8, "_");
     }
 
-    return result.toOwnedSlice(allocator);
+    if (std.ascii.isDigit(filename[0])) {
+        try out.append(allocator, '_');
+    }
+
+    var last_was_underscore = false;
+
+    for (filename) |c| {
+        if (std.ascii.isAlphabetic(c) or std.ascii.isDigit(c) or c == '_') {
+            try out.append(allocator, c);
+            last_was_underscore = false;
+        } else {
+            if (!last_was_underscore) {
+                try out.append(allocator, '_');
+                last_was_underscore = true;
+            }
+        }
+    }
+
+    if (out.items.len == 0) {
+        try out.append(allocator, '_');
+    }
+
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn repeat(
     allocator: std.mem.Allocator,
     s: []const u8,
     n: usize,
-) ![]u8 {
+) !?[]u8 {
+    if (n == 0) return null;
+
     const out = try allocator.alloc(u8, s.len * n);
     errdefer allocator.free(out);
 

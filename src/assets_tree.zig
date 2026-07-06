@@ -11,30 +11,81 @@ fn printHashMap(map: std.StringHashMap(Node)) void {
 }
 
 pub const Node = struct {
-    map: std.StringHashMap(Node),
-    separator: []const u8,
+    pub const Kind = enum {
+        root,
+        file,
+        directory,
+
+        pub fn getSeparator(self: Kind) []const u8 {
+            return switch (self) {
+                .root => "",
+                .directory => "/",
+                .file => "",
+            };
+        }
+    };
+
+    name: ?[]const u8,
+    children: std.StringHashMap(*Node),
+    kind: Kind,
+    parent: ?*const Node,
 
     pub var depth_prefix = "----";
 
-    pub fn init(allocator: mem.Allocator, separator: []const u8) Node {
+    pub fn init(allocator: mem.Allocator, kind: Kind, name: ?[]const u8, parent: ?*const Node) Node {
         return .{
-            .map = .init(allocator),
-            .separator = separator,
+            .children = .init(allocator),
+            .kind = kind,
+            .name = name,
+            .parent = parent,
         };
     }
 
-    pub fn deinitRecursively(self: *Node, allocator: std.mem.Allocator) void {
-        var map_it = self.map.iterator();
+    pub fn initHeap(allocator: mem.Allocator, kind: Kind, name: ?[]const u8, parent: ?*const Node) !*Node {
+        const node = try allocator.create(Node);
+        node.* = .init(allocator, kind, name, parent);
+        return node;
+    }
+
+    pub fn deinitRecursively(self: *Node, allocator: std.mem.Allocator, destroy_nodes: bool) void {
+        var map_it = self.children.iterator();
         while (map_it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinitRecursively(allocator);
+            entry.value_ptr.*.deinitRecursively(allocator, destroy_nodes);
         }
 
-        self.map.deinit();
+        self.children.deinit();
+        if (self.name) |name| allocator.free(name);
+
+        if (destroy_nodes) allocator.destroy(self);
     }
 
     pub fn isLeaf(self: Node) bool {
-        return self.map.count() == 0;
+        return self.children.count() == 0;
+    }
+
+    pub fn createPath(self: *const Node, allocator: mem.Allocator) ![]u8 {
+        var path_list = std.ArrayList(u8).empty;
+        errdefer path_list.deinit(allocator);
+        var node: ?*const Node = self;
+        while (node) |node_value| : (node = node_value.parent) {
+            if (node_value.name) |name| {
+                try path_list.insertSlice(allocator, 0, node_value.kind.getSeparator());
+                try path_list.insertSlice(allocator, 0, name);
+            }
+        }
+
+        return path_list.toOwnedSlice(allocator);
+    }
+
+    pub fn lessThan(_: void, a: *Node, b: *Node) bool {
+        if (a.isLeaf() == b.isLeaf() or (a.name == null and b.name == null)) {
+            if (a.name == null) return false;
+            if (b.name == null) return true;
+
+            return mem.lessThan(u8, a.name.?, b.name.?);
+        } else {
+            return @as(u32, @intFromEnum(a.kind)) < @as(u32, @intFromEnum(b.kind));
+        }
     }
 
     pub fn toString(self: Node, allocator: mem.Allocator, depth: u32) ![]u8 {
@@ -46,7 +97,7 @@ pub const Node = struct {
             prefix = try text_utils.repeat(allocator, Node.depth_prefix, depth);
         }
 
-        var map_it = self.map.iterator();
+        var map_it = self.children.iterator();
         while (map_it.next()) |entry| {
             if (depth != 0) try str_list.appendSlice(allocator, prefix);
             if (entry.value_ptr.isLeaf()) {
@@ -67,7 +118,7 @@ pub const Node = struct {
     }
 };
 
-pub fn create(init: std.process.Init, target_dir: []const u8) !Node {
+pub fn create(init: std.process.Init, target_dir: []const u8) !*Node {
     const io = init.io;
     const gpa = init.gpa;
 
@@ -78,27 +129,25 @@ pub fn create(init: std.process.Init, target_dir: []const u8) !Node {
 
     var walker = try dir.walk(gpa);
     defer walker.deinit();
-    var root: Node = .init(gpa, "");
+    const root = try Node.initHeap(gpa, .root, null, null);
 
     while (try walker.next(io)) |dir_entry| {
         if (dir_entry.kind == .file) {
-            // std.debug.print("{s}\n", .{dir_entry.path});
             var component_it = std.fs.path.componentIterator(dir_entry.path);
-            var target = &root;
+            var target = root;
 
             while (component_it.next()) |component_entry| {
-                var name_it = std.mem.splitScalar(u8, component_entry.name, '.');
-                const seprator = if (component_it.peekNext() == null) "." else "/";
-                while (name_it.next()) |name_entry| {
-                    const sub_node = target.map.getPtr(name_entry);
-                    if (sub_node) |node| {
-                        target = node;
-                    } else {
-                        const name_copy = try gpa.dupe(u8, name_entry);
-                        errdefer gpa.free(name_copy);
-                        try target.map.put(name_copy, .init(gpa, seprator));
-                        target = target.map.getPtr(name_entry).?;
-                    }
+                const kind: Node.Kind = if (component_it.peekNext() == null) .file else .directory;
+                const component_name = component_entry.name;
+                const sub_node = target.children.getPtr(component_name);
+
+                if (sub_node) |node| {
+                    target = node.*;
+                } else {
+                    const name_copy = try gpa.dupe(u8, component_name);
+                    const child = try Node.initHeap(gpa, kind, name_copy, target);
+                    try target.children.put(name_copy, child);
+                    target = child;
                 }
             }
         }

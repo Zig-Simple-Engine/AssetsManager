@@ -2,6 +2,8 @@ const std = @import("std");
 const mem = std.mem;
 const text_utils = @import("text_utils.zig");
 const assets_tree = @import("assets_tree.zig");
+const Node = assets_tree.Node;
+const Descriptor = @import("descriptors.zig").Descriptor;
 
 pub fn writeFile(init: std.process.Init, path: []const u8, text: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
@@ -16,72 +18,105 @@ pub fn writeFile(init: std.process.Init, path: []const u8, text: []const u8) !vo
     try file.writeStreamingAll(init.io, text);
 }
 
-pub fn toStructText(node: *assets_tree.Node, allocator: mem.Allocator, path: []const u8, depth: u32) ![]u8 {
+pub const Config = struct {
+    print_results: bool = false,
+    descriptors: []const *const Descriptor,
+};
+
+pub fn bakeAssetsTreeToCode(
+    init: std.process.Init,
+    path_to_root_node: []const u8,
+    assets_tree_root: *Node,
+    depth: u32,
+    config: Config,
+) ![]u8 {
     var str_list: std.ArrayList(u8) = .empty;
-    errdefer str_list.deinit(allocator);
+    const gpa = init.gpa;
+    errdefer str_list.deinit(gpa);
 
-    var prefix: []u8 = "";
-    if (depth != 0) {
-        prefix = try text_utils.repeat(allocator, "    ", depth);
-    }
+    var map_it = assets_tree_root.children.iterator();
+    var children: std.ArrayList(*Node) = .empty;
+    defer children.deinit(gpa);
 
-    var map_it = node.map.iterator();
     while (map_it.next()) |entry| {
-        try str_list.appendSlice(allocator, prefix);
-        if (entry.value_ptr.isLeaf()) {
-            try str_list.appendSlice(allocator, "pub const ");
-            try str_list.appendSlice(allocator, entry.key_ptr.*);
-            try str_list.appendSlice(allocator, " = @embedFile(\"");
-            try str_list.appendSlice(allocator, path);
-            try str_list.appendSlice(allocator, entry.key_ptr.*);
-            try str_list.appendSlice(allocator, "\");\n");
+        try children.append(gpa, entry.value_ptr.*);
+    }
+    std.mem.sort(*Node, children.items, {}, Node.lessThan);
+    for (children.items, 0..) |node, i| {
+        var content: ?[]u8 = null;
+        defer if (content) |c| gpa.free(c);
+        if (!node.isLeaf()) {
+            content = try bakeAssetsTreeToCode(
+                init,
+                path_to_root_node,
+                node,
+                depth + 1,
+                config,
+            );
+        }
+
+        const descripting_data: Descriptor.Data = .{
+            .id_in_parent = @intCast(i),
+            .depth = depth,
+            .node = node,
+            .content = content,
+            .path_to_root_node = path_to_root_node,
+        };
+
+        var suitable_descriptor: ?*const Descriptor = null;
+        for (config.descriptors) |descriptor| {
+            if (try descriptor.isSuitableData(init, descripting_data)) {
+                suitable_descriptor = descriptor;
+                break;
+            }
+        }
+
+        if (suitable_descriptor) |descriptor| {
+            const code = try descriptor.getCode(init, descripting_data);
+            defer gpa.free(code);
+
+            try str_list.appendSlice(gpa, code);
         } else {
-            try str_list.appendSlice(allocator, "pub const ");
-            try str_list.appendSlice(allocator, entry.key_ptr.*);
-            try str_list.appendSlice(allocator, " = struct {\n");
-
-            var child_path_list: std.ArrayList(u8) = .empty;
-            try child_path_list.appendSlice(allocator, path);
-            try child_path_list.appendSlice(allocator, entry.key_ptr.*);
-            try child_path_list.appendSlice(allocator, entry.value_ptr.*.separator);
-            const subnode_string = try toStructText(entry.value_ptr, allocator, child_path_list.items, depth + 1);
-            child_path_list.deinit(allocator);
-
-            try str_list.appendSlice(allocator, subnode_string);
-
-            allocator.free(subnode_string);
-            try str_list.appendSlice(allocator, prefix);
-            try str_list.appendSlice(allocator, "};\n");
+            return error.NoSuitableDescriptorForNode;
         }
     }
 
-    if (depth != 0) allocator.free(prefix);
-
-    return str_list.toOwnedSlice(allocator);
+    return str_list.toOwnedSlice(gpa);
 }
 
-pub fn buildAssetsDirToZigFile(init: std.process.Init, zig_file_path: []const u8, assets_dir: []const u8) !void {
+pub fn createCodeFileFromAssets(
+    init: std.process.Init,
+    file_path: []const u8,
+    assets_dir: []const u8,
+    config: Config,
+) !void {
     const gpa = init.gpa;
     var root = try assets_tree.create(init, assets_dir);
-    defer root.deinitRecursively(gpa);
+    defer root.deinitRecursively(gpa, true);
 
     var relative_path = assets_dir;
     var relative_path_formated = relative_path;
     var free_relative_path = false;
-    if (std.fs.path.dirname(zig_file_path)) |dir| {
+    if (std.fs.path.dirname(file_path)) |dir| {
         relative_path = try std.fs.path.relativePosix(gpa, ".", dir, assets_dir);
         relative_path_formated = try std.fmt.allocPrint(gpa, "{s}/", .{relative_path});
         free_relative_path = true;
     }
 
-    std.debug.print("Tree {s}: \n", .{assets_dir});
-    const toStructText_result = try toStructText(&root, gpa, relative_path_formated, 0);
-    try writeFile(init, zig_file_path, toStructText_result);
-    defer gpa.free(toStructText_result);
-    std.debug.print("{s}\n", .{toStructText_result});
-
-    if (free_relative_path) {
+    defer if (free_relative_path) {
         gpa.free(relative_path);
         gpa.free(relative_path_formated);
-    }
+    };
+
+    if (config.print_results) std.debug.print("Asset \"{s}\": \n", .{assets_dir});
+    const toStructText_result = try bakeAssetsTreeToCode(
+        init,
+        relative_path_formated,
+        root,
+        0,
+        config,
+    );
+    try writeFile(init, file_path, toStructText_result);
+    defer gpa.free(toStructText_result);
+    if (config.print_results) std.debug.print("{s}\n", .{toStructText_result});
 }
